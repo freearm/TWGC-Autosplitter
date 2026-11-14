@@ -148,6 +148,7 @@ startup
     // adds the start on "Yes", the reset on quitting to the menu, load
     // removal and the title card watch.
     vars.HasHelper = File.Exists("Components/asl-help");
+    settings.Add("exitReset", true, "Reset when the game closes");
 
     // Slow ticks until init succeeds; init raises this to 60 Hz.
     refreshRate = 4;
@@ -205,8 +206,10 @@ startup
                 break;
             case 12: // FinalSectionScene
                 if (flag == 0 || flag == 1) return "Outside Cave";
-                if (flag >= 2 && flag <= 6) return "Forest";
-                if (flag == 7) return "Confrontation";
+                if (flag >= 2 && flag <= 5) return "Forest";
+                // 6 is written as the Confrontation scene cuts in. 7 is only
+                // the battle's respawn point, about 12 s into the scene.
+                if (flag == 6 || flag == 7) return "Confrontation";
                 break;
             case 13: // EpilogueScene
                 if (flag == 0 || flag == 1) return "Epilogue";
@@ -258,20 +261,30 @@ init
     // Throwing here makes LiveSplit run init again on its next tick (init only
     // counts as done once it returns), and startup set that tick to 4 Hz, so
     // the wait costs a handful of event-log lines rather than hundreds.
+    //
+    // LiveSplit keeps the same Process object through every retry, and .NET
+    // caches a process's module list the first time it's read. Reading it
+    // in the game's first moments, before Mono has loaded, would cache a list
+    // without Mono and the wait would never end (it did, for half an hour
+    // once). So the modules are only checked after 5 s, on a fresh read.
     if (vars.HasHelper)
     {
         bool ready = false;
         try
         {
             double up = (DateTime.Now - game.StartTime).TotalSeconds;
-            bool unity = false, mono = false;
-            foreach (ProcessModule m in game.Modules)
+            if (up >= 5.0)
             {
-                string n = m.ModuleName.ToLowerInvariant();
-                if (n == "unityplayer.dll") unity = true;
-                if (n.StartsWith("mono")) mono = true;
+                game.Refresh();
+                bool unity = false, mono = false;
+                foreach (ProcessModule m in game.Modules)
+                {
+                    string n = m.ModuleName.ToLowerInvariant();
+                    if (n == "unityplayer.dll") unity = true;
+                    if (n.StartsWith("mono")) mono = true;
+                }
+                ready = unity && mono;
             }
-            ready = up >= 5.0 && unity && mono;
         }
         catch { ready = false; }
         if (!ready) throw new Exception("TWGC: waiting for the game to finish starting");
@@ -361,11 +374,99 @@ init
     vars.LoadStats = new long[2];
     // {watched list pointers, their sizes when armed, detection time, title time}
     vars.TitleWatch = new object[] { null, null, 0L, 0L };
+    // {watched list pointers, their sizes, colour offset, detection time,
+    // first frame time, the graphic}. See IL FADE WATCH in update.
+    vars.FadeWatch = new object[] { null, null, -1, 0L, 0L, 0L };
+    // {trigger object addresses, triggered offset, detection time, first
+    // frame time, which one}, and the scan that finds them: {state (0 idle,
+    // 1 running, 2 done), addresses found, log line, the load it was for,
+    // what each one calls}. See TRIGGER WATCH in update.
+    vars.TrigWatch = new object[] { null, -1, 0L, 0L, -1 };
+    vars.TrigScan = new object[] { 0, null, "", 0L, null };
+    vars.TrigNames = new string[0];
+    vars.TrigScanFor = -1L;
+    vars.CtVTable = 0L;
+    vars.CtResolve = null;
+    // Paused spans on vars.Now's clock, the last few, for stepping back
+    // through game time (BackGameTime).
+    vars.PauseSpans = new List<long[]>();
+    vars.PauseFrom = 0L;
+    // A moment some seconds of unpaused play before another: the game's
+    // WaitForSeconds stands still while paused (time scale 0).
+    vars.BackGameTime = (Func<long, double, long>)((at, sec) =>
+    {
+        long need = (long)(sec * TimeSpan.TicksPerSecond);
+        long t = at - need;
+        for (int it = 0; it < 6; it++)
+        {
+            long paused = 0;
+            foreach (long[] sp in (List<long[]>)vars.PauseSpans)
+            {
+                long a = Math.Max(sp[0], t), b = Math.Min(sp[1], at);
+                if (b > a) paused += b - a;
+            }
+            long nt = at - need - paused;
+            if (nt == t) break;
+            t = nt;
+        }
+        return t;
+    });
+    // A managed string from the game, or null: length at +0x10, UTF-16 from +0x14.
+    var procS = game;
+    vars.ReadStr = (Func<IntPtr, string>)(sp =>
+    {
+        if (sp == IntPtr.Zero) return null;
+        int len = procS.ReadValue<int>(sp + 0x10);
+        if (len < 0 || len > 400) return null;
+        if (len == 0) return "";
+        byte[] raw = procS.ReadBytes(sp + 0x14, len * 2);
+        if (raw == null || raw.Length != len * 2) return null;
+        return System.Text.Encoding.Unicode.GetString(raw);
+    });
     // {m_EventSystems field address (set once TryLoad has it), time of the
     // last drop to zero}. See CLICK TIMING in update.
     vars.ClickWatch = new long[] { 0L, 0L };
     vars.Spans = new List<long[]>();
     vars.RunStartAbs = 0L;
+
+    // FRAME HISTORY. The thread records when each frame began (the moment the
+    // frame counter ticked), the last 16384 frames, so an IL ending can be
+    // placed on the exact frame after the fact (see IL ENDINGS in update).
+    // {frame numbers, their tick times, next slot}
+    vars.FrameRing = new object[] { new int[16384], new long[16384], new int[1] };
+    // The game stamps its checkpoints with its own DateTime.Now. This is that
+    // clock minus vars.Now, so a stamp can be placed on vars.Now's clock:
+    // {estimate, last bucket's max, this bucket's max, this bucket's start}.
+    vars.WallOffset = new long[] { long.MinValue, long.MinValue, long.MinValue, 0L };
+    // The tick time of one frame, or 0 if it isn't in the history.
+    vars.FrameTick = (Func<int, long>)(fr =>
+    {
+        var ring = (object[])vars.FrameRing;
+        var fs = (int[])ring[0]; var ts = (long[])ring[1];
+        lock (fs)
+        {
+            for (int k = 0; k < fs.Length; k++)
+                if (ts[k] != 0L && fs[k] == fr) return ts[k];
+        }
+        return 0L;
+    });
+    // The last frame that began at or before a moment, or -1.
+    vars.FrameAt = (Func<long, int>)(at =>
+    {
+        var ring = (object[])vars.FrameRing;
+        var fs = (int[])ring[0]; var ts = (long[])ring[1];
+        int best = -1; long oldest = long.MaxValue;
+        lock (fs)
+        {
+            for (int k = 0; k < fs.Length; k++)
+            {
+                if (ts[k] == 0L) continue;
+                if (ts[k] < oldest) oldest = ts[k];
+                if (ts[k] <= at && fs[k] > best) best = fs[k];
+            }
+        }
+        return at < oldest ? -1 : best;
+    });
     // Load time removed between a run start and a moment, both on vars.Now's
     // clock: finished spans clipped to that window, plus the load in flight.
     vars.RemovedUpTo = (Func<long, long, long>)((runStart, at) =>
@@ -415,6 +516,10 @@ init
         var stats = (long[])vars.LoadStats;
         var tw = (object[])vars.TitleWatch;
         var cw = (long[])vars.ClickWatch;
+        var ring = (object[])vars.FrameRing;
+        var wo = (long[])vars.WallOffset;
+        var fwt = (object[])vars.FadeWatch;
+        var trw = (object[])vars.TrigWatch;
         var proc = game;
         Action tBegin = vars.TimeBegin, tEnd = vars.TimeEnd;
         Func<long> clockNow = vars.Now;
@@ -430,6 +535,14 @@ init
                 int titleFrame = -1;
                 int lastEs = -1;
                 long lastPoll = 0;
+                int lastFrame = -1;
+                IntPtr[] fadeLists = null;
+                int fadeFrame = -1;
+                long[] trigList = null;
+                int trigFrame = -1;
+                var ringF = (int[])((object[])ring)[0];
+                var ringT = (long[])((object[])ring)[1];
+                var ringI = (int[])((object[])ring)[2];
                 while (!stop[0])
                 {
                     long now = clockNow();
@@ -444,6 +557,23 @@ init
                     if (count >= 0 && last >= 0 && count != last)
                         pending.Add(new long[] { now, count, last, frame, (count < last && frame >= 0) ? -1 : now });
                     if (count >= 0) last = count;
+                    if (frame >= 0 && frame != lastFrame)
+                    {
+                        lock (ringF)
+                        {
+                            ringF[ringI[0]] = frame;
+                            ringT[ringI[0]] = now;
+                            ringI[0] = (ringI[0] + 1) % ringF.Length;
+                        }
+                        lastFrame = frame;
+                    }
+                    // DateTime.Now trails real time by up to one of its steps,
+                    // so the largest gap seen over a couple of seconds is the
+                    // true offset. Two buckets let it follow slow drift.
+                    long wallD = DateTime.Now.Ticks - now;
+                    if (now - wo[3] > TimeSpan.TicksPerSecond * 2) { wo[1] = wo[2]; wo[2] = wallD; wo[3] = now; }
+                    else if (wallD > wo[2]) wo[2] = wallD;
+                    wo[0] = Math.Max(wo[1], wo[2]);
                     foreach (var ev in pending)
                     {
                         if (ev[4] != -1) continue;
@@ -485,6 +615,64 @@ init
                         }
                         else if (frame > titleFrame) tw[3] = now;
                     }
+
+                    // IL FADE WATCH (see update). A graphic joining a watched
+                    // canvas is the fade only if it is black; anything else
+                    // that switches on is absorbed into the baseline. Its time
+                    // is the next frame tick, as with the title card.
+                    var fl = fwt[0] as IntPtr[];
+                    if (!ReferenceEquals(fl, fadeLists)) { fadeLists = fl; fadeFrame = -1; }
+                    if (fl != null && (long)fwt[5] == 0L)
+                    {
+                        var fb = (int[])fwt[1];
+                        int co = (int)fwt[2];
+                        for (int i = 0; i < fl.Length && (long)fwt[5] == 0L; i++)
+                        {
+                            int n = proc.ReadValue<int>(fl[i] + 0x18);
+                            if (n > fb[i])
+                            {
+                                IntPtr items = proc.ReadPointer(fl[i] + 0x10);
+                                for (int j = fb[i]; j < n && items != IntPtr.Zero; j++)
+                                {
+                                    IntPtr gph = proc.ReadPointer(items + 0x20 + 8 * j);
+                                    if (gph == IntPtr.Zero) continue;
+                                    float cr = proc.ReadValue<float>(gph + co);
+                                    float cg = proc.ReadValue<float>(gph + co + 4);
+                                    float cb = proc.ReadValue<float>(gph + co + 8);
+                                    if (cr < 0.01f && cg < 0.01f && cb < 0.01f)
+                                    {
+                                        fwt[3] = now;
+                                        if (frame < 0) fwt[4] = now; else fadeFrame = frame;
+                                        fwt[5] = (long)gph;
+                                        break;
+                                    }
+                                }
+                            }
+                            fb[i] = n;
+                        }
+                    }
+                    else if (fl != null && (long)fwt[4] == 0L && fadeFrame >= 0 && frame > fadeFrame) fwt[4] = now;
+
+                    // TRIGGER WATCH (see update): the trigger's own flag,
+                    // set in the physics step of the frame the player crosses.
+                    // Its time is the next frame tick, as everywhere else.
+                    var tgs = trw[0] as long[];
+                    if (!ReferenceEquals(tgs, trigList)) { trigList = tgs; trigFrame = -1; }
+                    if (tgs != null && (long)trw[2] == 0L)
+                    {
+                        int toff = (int)trw[1];
+                        for (int i = 0; i < tgs.Length; i++)
+                        {
+                            if (proc.ReadValue<byte>(new IntPtr(tgs[i] + toff)) != 0)
+                            {
+                                trw[4] = i;
+                                trw[2] = now;
+                                if (frame < 0) trw[3] = now; else trigFrame = frame;
+                                break;
+                            }
+                        }
+                    }
+                    else if (tgs != null && (long)trw[3] == 0L && trigFrame >= 0 && frame > trigFrame) trw[3] = now;
 
                     stats[0]++; stats[1] = sw.Elapsed.Ticks;
                     Thread.Sleep(1);
@@ -533,6 +721,59 @@ init
                 vars.TLog("TryLoad: GraphicRegistry s_Instance at 0x" + ((long)vars.GrField).ToString("X") + " (" + gp.ToString() + ")");
             }
             catch (Exception e) { vars.TLog("TryLoad: GraphicRegistry not found: " + e.Message); }
+
+            // The colour of a UI graphic, for the IL FADE WATCH (update).
+            try
+            {
+                var gc = mono["UnityEngine.UI", "Graphic", 0];
+                vars.ColorOff = (int)gc["m_Color"];
+                vars.TLog("TryLoad: Graphic.m_Color at +0x" + ((int)vars.ColorOff).ToString("X"));
+            }
+            catch (Exception e) { vars.TLog("TryLoad: Graphic.m_Color not found, IL fades split late: " + e.Message); }
+
+            // The trigger that ends First Cabin Reprise, for the TRIGGER
+            // WATCH (update): CallbackTrigger's fields, the path from its
+            // UnityEvent to each call's method name, and the class's vtable,
+            // which every live CallbackTrigger object starts with. asl-help
+            // keeps its vtable lookup internal, so I reach it by reflection.
+            try
+            {
+                var ct = mono["Assembly-CSharp", "CallbackTrigger", 0];
+                vars.CtTriggered = (int)ct["triggered"];
+                vars.CtEvent = (int)ct["OnTriggeredCallbacks"];
+                vars.UebCalls = (int)mono["UnityEngine.CoreModule", "UnityEventBase", 0]["m_PersistentCalls"];
+                vars.PcgList = (int)mono["UnityEngine.CoreModule", "PersistentCallGroup", 0]["m_Calls"];
+                var pc = mono["UnityEngine.CoreModule", "PersistentCall", 0];
+                vars.PcMethod = (int)pc["m_MethodName"];
+                try { vars.PcType = (int)pc["m_TargetAssemblyTypeName"]; } catch { vars.PcType = -1; }
+                var bf = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public;
+                object mgr = null;
+                for (Type t = ((object)vars.Helper).GetType(); t != null && mgr == null; t = t.BaseType)
+                {
+                    if (!t.IsGenericType || !t.GetGenericTypeDefinition().Name.StartsWith("HelperBase")) continue;
+                    var pr = t.GetProperty("Manager", bf | System.Reflection.BindingFlags.Static);
+                    if (pr != null) mgr = pr.GetValue(null, null);
+                }
+                if (mgr == null) throw new Exception("asl-help's memory manager not found");
+                var mi = mgr.GetType().GetMethod("ClassVTable", bf | System.Reflection.BindingFlags.Instance);
+                if (mi == null) throw new Exception("ClassVTable not found");
+                // Mono builds a class's vtable the first time the class is
+                // used, so on a fresh launch (at the menu, before any level
+                // has loaded a trigger) it is still 0. The lookup is kept and
+                // run again once the level is up (see TRIGGER WATCH).
+                IntPtr klass = (IntPtr)ct.Address;
+                vars.CtResolve = (Func<long>)(() => (long)(IntPtr)mi.Invoke(mgr, new object[] { klass }));
+                vars.CtVTable = vars.CtResolve();
+                vars.TLog("TryLoad: CallbackTrigger vtable 0x" + ((long)vars.CtVTable).ToString("X")
+                        + ((long)vars.CtVTable == 0L ? " (not built yet, looked up again once a level loads)" : "")
+                        + ", triggered at +0x" + ((int)vars.CtTriggered).ToString("X"));
+            }
+            catch (Exception e)
+            {
+                vars.CtVTable = 0L;
+                vars.CtResolve = null;
+                vars.TLog("TryLoad: CallbackTrigger not resolved, First Cabin Reprise ILs fall back to the fade: " + e.Message);
+            }
             return true;
         });
         vars.Helper.Load();
@@ -542,6 +783,24 @@ init
     vars.ClickEdge = false;
     vars.ClickAt = DateTime.MinValue;
     vars.ClickPrecise = false;
+    // IL runs (see IL RUNS in update).
+    vars.ClickDecide = false;
+    vars.NewGameStartNow = false;
+    vars.IlStartNow = false;
+    vars.IlStarting = false;
+    vars.IlStartLevel = null;
+    vars.IlStartSub = null;
+    vars.IlStartAt = 0L;
+    vars.IlMode = false;
+    vars.IlLevel = null;
+    vars.IlEndNow = false;
+    vars.IlDone = false;
+    vars.IlEndAt = 0L;
+    vars.ColorOff = -1;
+    vars.FixSplitCap = 5.0;
+    vars.RiseAt = 0L;
+    vars.RiseFrame = -1L;
+    vars.RiseScene = -1;
     vars.Pending = false;
     vars.PendingSince = DateTime.MinValue;
     vars.CancelStart = false;
@@ -702,6 +961,22 @@ update
         vars.ClickAt = new DateTime(vars.ClickPrecise ? dropAt : (long)vars.Now());
         vars.TLog("menu click (input switched off) at " + ((DateTime)vars.ClickAt).ToString("HH:mm:ss.fff")
                 + (vars.ClickPrecise ? " (thread)" : " (60 Hz tick)"));
+        vars.ClickDecide = true;
+    }
+
+    // IL RUNS. Scene Selection saves its checkpoint in the same frame as its
+    // click (SceneSelectionButtonGroup.TriggerSceneSelection stores the scene
+    // and the flag, then loads). New Game, Continue and brightness save
+    // nothing for at least a few seconds. So after each click I wait a
+    // quarter of a second: a checkpoint written from the menu in that window
+    // makes it an IL run of that checkpoint's level (decided in the registry
+    // section below), and anything else falls through to the New Game start.
+    // Either way the start is backdated to the click, so the wait costs no
+    // accuracy, and a Scene Selection click never needs a cancelled start.
+    if (vars.ClickDecide && (new DateTime((long)vars.Now()) - (DateTime)vars.ClickAt).TotalSeconds > 0.25)
+    {
+        vars.ClickDecide = false;
+        vars.NewGameStartNow = true;
     }
 
     // A click start still waiting for New Game proof is cancelled if the menu
@@ -734,6 +1009,64 @@ update
     // whenever its thread is running. Both count scenes other than the pause
     // menu, so a quit from the pause menu (pause, old, new: three scenes) is
     // a load from its first instant.
+    // IL ENDINGS. Most ILs end where the next level begins. Three end
+    // earlier: First Cabin Reprise and Second Cabin (part 2) at a trigger
+    // (TRIGGER WATCH), and Epilogue at the blue (see the blue in update).
+    // This is First Cabin Reprise's last fallback, placed once the next scene
+    // has loaded: its ending fade is a fixed 12 s, and the trigger comes
+    // 13.5 s of play before the fade. The game starts the fade,
+    // locks pausing, waits the fade out in game time, then on the next frame
+    // requests the cutscene's load, which adds a scene at the end of that
+    // frame. So from the load's first frame I step back one frame to the
+    // fade's last, then back the fade's length to the frame that started it,
+    // and the split is the frame after that one, the first frame drawn with
+    // the fade under way (the same rule as the title card). The split is
+    // decided once the cutscene has loaded, which rules out death reloads,
+    // and is written back to that moment, so the timer runs on past it first.
+    if (!((IDictionary<string, object>)vars).ContainsKey("IlFadeEnd"))
+    {
+        // Returns whether it found an ending (a bool, because ASL rewrites a
+        // bare return).
+        vars.IlFadeEnd = (Func<int, bool>)(nowScene =>
+        {
+            if (!vars.IlMode || vars.IlEndNow || vars.IlDone) return false;
+            double fade;
+            if (vars.IlLevel == "First Cabin Reprise" && vars.RiseScene == 6) fade = 12.0;
+            else return false;
+            if (nowScene < 0 || nowScene == vars.RiseScene) return false; // a reload, not the ending
+            long fadeTicks = (long)(fade * TimeSpan.TicksPerSecond);
+            long at = 0L;
+            string how;
+            int riseFrame = (int)(long)vars.RiseFrame;
+            long lastFadeTick = riseFrame >= 0 ? vars.FrameTick(riseFrame - 1) : 0L;
+            int f0 = lastFadeTick != 0L ? vars.FrameAt(lastFadeTick - fadeTicks) : -1;
+            if (f0 >= 0) at = vars.FrameTick(f0 + 1);
+            if (at != 0L)
+                how = "frame " + (f0 + 1) + " (fade began in frame " + f0 + ", load requested in frame " + riseFrame + ")";
+            else
+            {
+                at = (long)vars.RiseAt - fadeTicks;
+                how = "load request minus " + fade.ToString("0") + " s (no frame history)";
+            }
+            vars.TLog("IL ending: " + vars.IlLevel + " fade began at " + new DateTime(at).ToString("HH:mm:ss.fff")
+                    + ", " + (((long)vars.RiseAt - at) / (double)TimeSpan.TicksPerSecond).ToString("0.000")
+                    + " s before the load, by " + how);
+            if (vars.IlLevel == "First Cabin Reprise")
+            {
+                at = vars.BackGameTime(at, 13.5);
+                vars.TLog("IL ending: First Cabin Reprise trigger placed 13.5 s of play before the fade, at "
+                        + new DateTime(at).ToString("HH:mm:ss.fff") + " (fallback)");
+            }
+            vars.IlEndAt = at;
+            vars.IlEndNow = true;
+            return true;
+        });
+    }
+    Func<int> activeNow = () =>
+    {
+        try { return vars.HelperReady ? (int)vars.Helper.Scenes.Active.Index : -1; } catch { return -1; }
+    };
+
     vars.LoadingOld = vars.Loading;
     bool loading = false;
     bool pausePresent = false;
@@ -762,10 +1095,17 @@ update
     {
         vars.LoadStartedAt = DateTime.Now;
         vars.TLog("load began");
+        if (!vars.PreciseLoads)
+        {
+            vars.RiseAt = (long)vars.Now();
+            vars.RiseFrame = -1L;
+            vars.RiseScene = activeNow();
+        }
     }
     else if (!loading && vars.LoadingOld)
     {
         vars.TLog("load ended after " + (DateTime.Now - (DateTime)vars.LoadStartedAt).TotalSeconds.ToString("0.000") + " s (60 Hz reading)");
+        if (!vars.PreciseLoads) vars.IlFadeEnd(activeNow());
     }
 
     // The precise spans. Each queued event is one scene-count change:
@@ -784,12 +1124,16 @@ update
             {
                 vars.InLoad = true;
                 vars.LoadFrom = ev[0];
+                vars.RiseAt = ev[0];
+                vars.RiseFrame = ev[3];
+                vars.RiseScene = activeNow();
             }
             else if (vars.InLoad && nonPause <= 1)
             {
                 vars.InLoad = false;
                 long from = vars.LoadFrom, to = ev[4];
                 vars.Spans.Add(new long[] { from, to });
+                vars.IlFadeEnd(activeNow());
                 vars.TLog("load " + new DateTime(from).ToString("HH:mm:ss.fff") + " to " + new DateTime(to).ToString("HH:mm:ss.fff")
                         + " = " + ((to - from) / (double)TimeSpan.TicksPerSecond).ToString("0.000") + " s (precise)");
                 if (!vars.StatsLogged)
@@ -835,6 +1179,264 @@ update
                 vars.TitleArmed = true;
                 vars.TLog("title watch armed on " + snap.Count + " canvases");
             }
+        }
+    }
+
+    // Paused spans for BackGameTime, at this tick's resolution.
+    if (pausePresent && (long)vars.PauseFrom == 0L) vars.PauseFrom = (long)vars.Now();
+    else if (!pausePresent && (long)vars.PauseFrom != 0L)
+    {
+        var ps = (List<long[]>)vars.PauseSpans;
+        ps.Add(new long[] { (long)vars.PauseFrom, (long)vars.Now() });
+        if (ps.Count > 32) ps.RemoveAt(0);
+        vars.PauseFrom = 0L;
+    }
+
+    // TRIGGER WATCH. Two ILs end where the player walks into a trigger, a
+    // CallbackTrigger whose own "triggered" flag goes true in the frame it
+    // is crossed:
+    //   First Cabin Reprise: the one whose only call is
+    //     SecondSectionSceneProgression.EndScene (the fade follows 13.5 s
+    //     of play later).
+    //   Second Cabin (part 2): in Night Walk Reprise (8:5), the first of the
+    //     two that lead to ThirdSectionScene's end: the one calling
+    //     ForestRepriseScore.StartEnd (it also switches an object on), and
+    //     the one calling ThirdSectionSceneProgression.SceneEnd directly.
+    //     One crossed earlier in the level (8:7, 8:6) is ignored.
+    // Nothing static leads to those objects, so once per load of the level I
+    // scan the game's writable memory, on a thread of its own, for objects
+    // starting with CallbackTrigger's vtable, keep the live ones (native
+    // pointer set, not yet triggered) whose event makes one of those calls,
+    // and hand them to the load thread to poll every millisecond. The split
+    // shows on the frame after the crossing. If the scan finds nothing, a
+    // First Cabin Reprise IL still ends at the fade, dated 13.5 s of play
+    // before it. Second Cabin (part 2) has no such fallback: after StartEnd
+    // the scene waits out its music loop, so the fade's time says nothing
+    // exact about the crossing, and no split beats a wrong one.
+    if (vars.PreciseLoads && vars.IlMode && !vars.IlDone && !vars.IlEndNow
+        && ((long)vars.CtVTable != 0L || vars.CtResolve != null))
+    {
+        var trw = (object[])vars.TrigWatch;
+        var tsc = (object[])vars.TrigScan;
+        int act = activeNow();
+        bool fcr = vars.IlLevel == "First Cabin Reprise";
+        bool sc2 = vars.IlLevel == "Second Cabin (part 2)";
+        bool want = !vars.InLoad && vars.HelperReady
+            && ((fcr && act == 6 && vars.Scene == 6 && vars.Flag == 3)
+             || (sc2 && act == 8 && vars.Scene == 8 && vars.Flag >= 5 && vars.Flag <= 7));
+        long token = (long)vars.LoadFrom;
+        if (!want)
+        {
+            if (trw[0] != null) { trw[0] = null; vars.TLog("trigger watch withdrawn (loading or left the checkpoint)"); }
+            if ((int)tsc[0] == 2) tsc[0] = 0;
+        }
+        else if ((long)trw[2] != 0L)
+        {
+            if ((long)trw[3] != 0L || (long)vars.Now() - (long)trw[2] > TimeSpan.TicksPerSecond / 10)
+            {
+                long seenAt = (long)trw[2], frameAt = (long)trw[3];
+                int which = (int)trw[4];
+                var addrs = (long[])trw[0];
+                var names = (string[])vars.TrigNames;
+                string what = which >= 0 && which < names.Length ? names[which] : "?";
+                if (sc2 && vars.Flag != 5)
+                {
+                    // Crossed before Night Walk Reprise: drop that one, keep the rest.
+                    var keepA = new List<long>();
+                    var keepN = new List<string>();
+                    for (int k = 0; addrs != null && k < addrs.Length; k++)
+                        if (k != which) { keepA.Add(addrs[k]); keepN.Add(k < names.Length ? names[k] : "?"); }
+                    vars.TrigNames = keepN.ToArray();
+                    trw[2] = 0L; trw[3] = 0L; trw[4] = -1;
+                    trw[0] = keepA.Count > 0 ? keepA.ToArray() : null;
+                    vars.TLog("trigger " + what + " crossed at 8:" + vars.Flag + ", before Night Walk Reprise: ignored");
+                }
+                else
+                {
+                    vars.IlEndAt = frameAt != 0L ? frameAt : seenAt;
+                    vars.IlEndNow = true;
+                    trw[0] = null;
+                    vars.TLog("IL ending: " + vars.IlLevel + " trigger " + what + " crossed at " + new DateTime(seenAt).ToString("HH:mm:ss.fff")
+                            + ", first frame " + (frameAt != 0L ? new DateTime(frameAt).ToString("HH:mm:ss.fff") : "unknown") + " (live)");
+                }
+            }
+        }
+        else if ((int)tsc[0] == 2)
+        {
+            tsc[0] = 0;
+            var found = (List<long>)tsc[1];
+            vars.TLog((string)tsc[2]);
+            if ((long)tsc[3] == token && found != null && found.Count > 0)
+            {
+                vars.TrigNames = ((List<string>)tsc[4]).ToArray();
+                trw[1] = (int)vars.CtTriggered;
+                trw[2] = 0L; trw[3] = 0L; trw[4] = -1;
+                trw[0] = found.ToArray();
+                vars.TLog("trigger watch armed on " + found.Count + " trigger(s): " + string.Join(", ", (string[])vars.TrigNames));
+            }
+        }
+        else if (trw[0] == null && (int)tsc[0] == 0 && (long)vars.TrigScanFor != token && (long)vars.CtVTable == 0L)
+        {
+            // The level's triggers exist now, so the vtable does too.
+            try { vars.CtVTable = (long)vars.CtResolve(); }
+            catch (Exception e) { vars.TLog("trigger watch: vtable lookup threw: " + e.Message); }
+            if ((long)vars.CtVTable != 0L)
+                vars.TLog("trigger watch: CallbackTrigger vtable 0x" + ((long)vars.CtVTable).ToString("X") + " now built");
+            else
+            {
+                vars.TrigScanFor = token;
+                vars.TLog("trigger watch: CallbackTrigger vtable still 0 with the level loaded, NO trigger split this load");
+            }
+        }
+        else if (trw[0] == null && (int)tsc[0] == 0 && (long)vars.TrigScanFor != token)
+        {
+            vars.TrigScanFor = token;
+            tsc[0] = 1;
+            var procT = game;
+            long vt = (long)vars.CtVTable;
+            int evOff = (int)vars.CtEvent, trOff = (int)vars.CtTriggered, callsOff = (int)vars.UebCalls;
+            int listOff = (int)vars.PcgList, mOff = (int)vars.PcMethod, tyOff = (int)vars.PcType;
+            Func<IntPtr, string> rs = vars.ReadStr;
+            var tsT = tsc;
+            long tok = token;
+            // {type name prefix, method} pairs that make a trigger an ending.
+            string[][] ends = fcr
+                ? new[] { new[] { "SecondSectionSceneProgression", "EndScene" } }
+                : new[] { new[] { "ForestRepriseScore", "StartEnd" }, new[] { "ThirdSectionSceneProgression", "SceneEnd" } };
+            var scan = new Thread(() =>
+            {
+                var hits = new List<long>();
+                var hitNames = new List<string>();
+                int cands = 0;
+                long bytes = 0;
+                string err = "";
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                try
+                {
+                    const int Chunk = 16 << 20;
+                    foreach (var page in procT.MemoryPages())
+                    {
+                        if (((uint)page.Protect & 0xFFu) != 0x04u || (uint)page.Type != 0x20000u) continue;
+                        long baseA = (long)page.BaseAddress;
+                        long size = (long)(ulong)page.RegionSize;
+                        for (long off = 0; off < size; off += Chunk)
+                        {
+                            int n = (int)Math.Min((long)Chunk, size - off);
+                            byte[] buf = procT.ReadBytes(new IntPtr(baseA + off), n);
+                            if (buf == null) continue;
+                            bytes += buf.Length;
+                            for (int k = 0; k + 8 <= buf.Length; k += 8)
+                            {
+                                if (BitConverter.ToInt64(buf, k) != vt) continue;
+                                cands++;
+                                long obj = baseA + off + k;
+                                if (procT.ReadPointer(new IntPtr(obj + 0x10)) == IntPtr.Zero) continue; // destroyed
+                                if (procT.ReadValue<byte>(new IntPtr(obj + trOff)) != 0) continue;     // already used
+                                IntPtr ev = procT.ReadPointer(new IntPtr(obj + evOff));
+                                if (ev == IntPtr.Zero) continue;
+                                IntPtr grp = procT.ReadPointer(ev + callsOff);
+                                if (grp == IntPtr.Zero) continue;
+                                IntPtr list = procT.ReadPointer(grp + listOff);
+                                if (list == IntPtr.Zero) continue;
+                                int cnt = procT.ReadValue<int>(list + 0x18);
+                                IntPtr items = procT.ReadPointer(list + 0x10);
+                                for (int c = 0; c < cnt && c < 16 && items != IntPtr.Zero; c++)
+                                {
+                                    IntPtr call = procT.ReadPointer(items + 0x20 + 8 * c);
+                                    if (call == IntPtr.Zero) continue;
+                                    string m = rs(procT.ReadPointer(call + mOff));
+                                    string ty = tyOff >= 0 ? rs(procT.ReadPointer(call + tyOff)) : null;
+                                    string hit = null;
+                                    foreach (var e in ends)
+                                        if (m == e[1] && (string.IsNullOrEmpty(ty) || ty.StartsWith(e[0]))) hit = e[0] + "." + e[1];
+                                    if (hit != null)
+                                    {
+                                        hits.Add(obj);
+                                        hitNames.Add(hit);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (Exception e) { err = ", stopped by " + e.Message; }
+                tsT[4] = hitNames;
+                tsT[1] = hits;
+                tsT[2] = "trigger scan: " + (bytes >> 20) + " MB in " + sw.ElapsedMilliseconds + " ms, "
+                       + cands + " CallbackTrigger objects, " + hits.Count + " live ending trigger(s)" + err;
+                tsT[3] = tok;
+                tsT[0] = 2;
+            });
+            scan.IsBackground = true;
+            scan.Start();
+            vars.TLog("trigger scan started");
+        }
+    }
+
+    // IL FADE WATCH. The fallback for a First Cabin Reprise IL when the
+    // TRIGGER WATCH has nothing to watch: it shows the split once the
+    // scene's ending fade begins, dated back 13.5 s of play to the trigger. The fade is a black UI Image that
+    // switches on (registering with its canvas) in the frame the fade starts.
+    // While the IL is in its last checkpoint I hand every canvas's graphic
+    // list to the load thread, which catches the first black graphic to join
+    // one. A quarter second later I check that it is still almost clear: the
+    // ending fades over 12 s, nearly invisible that early, while a 0.8 s reload fade is about
+    // a fifth opaque by then and a black icon is solid. A pass is the split,
+    // dated to the fade's first frame; a fail rearms. Pausing and loads
+    // withdraw the watch (pausing is locked once the fade begins). If the
+    // watch misses it, IL ENDINGS above still places the split once the
+    // cutscene loads.
+    if (vars.PreciseLoads && vars.IlMode && !vars.IlDone && !vars.IlEndNow && (int)vars.ColorOff >= 0
+        && ((IDictionary<string, object>)vars).ContainsKey("GrField"))
+    {
+        var fw = (object[])vars.FadeWatch;
+        int act = activeNow();
+        bool want = !pausePresent && !vars.InLoad && vars.HelperReady
+            && vars.IlLevel == "First Cabin Reprise" && act == 6 && vars.Scene == 6 && vars.Flag == 3;
+        if (fw[0] != null && !want)
+        {
+            fw[0] = null;
+            fw[5] = 0L;
+            vars.TLog("IL fade watch withdrawn (paused, loading, or left the checkpoint)");
+        }
+        else if (fw[0] == null && want)
+        {
+            List<long[]> snap = vars.CanvasLists();
+            if (snap.Count > 0)
+            {
+                var lists = new IntPtr[snap.Count];
+                var sizes = new int[snap.Count];
+                for (int i = 0; i < snap.Count; i++) { lists[i] = new IntPtr(snap[i][0]); sizes[i] = (int)snap[i][1]; }
+                fw[2] = (int)vars.ColorOff;
+                fw[3] = 0L; fw[4] = 0L; fw[5] = 0L;
+                fw[1] = sizes;
+                fw[0] = lists;
+                vars.TLog("IL fade watch armed on " + snap.Count + " canvases");
+            }
+        }
+        else if (fw[0] != null && (long)fw[5] != 0L && (long)vars.Now() - (long)fw[3] >= TimeSpan.TicksPerSecond / 4)
+        {
+            float alpha = game.ReadValue<float>(new IntPtr((long)fw[5] + (int)fw[2] + 12));
+            long seenAt = (long)fw[3], frameAt = (long)fw[4];
+            fw[0] = null;
+            fw[5] = 0L;
+            if (alpha < 0.05f)
+            {
+                long at = frameAt != 0L ? frameAt : seenAt;
+                vars.TLog("IL ending: " + vars.IlLevel + " fade seen at " + new DateTime(seenAt).ToString("HH:mm:ss.fff")
+                        + ", first frame " + (frameAt != 0L ? new DateTime(frameAt).ToString("HH:mm:ss.fff") : "unknown")
+                        + ", alpha " + alpha.ToString("0.0000") + " a quarter second in (live)");
+                if (vars.IlLevel == "First Cabin Reprise")
+                {
+                    at = vars.BackGameTime(at, 13.5);
+                    vars.TLog("IL ending: First Cabin Reprise trigger placed 13.5 s of play before the fade, at "
+                            + new DateTime(at).ToString("HH:mm:ss.fff") + " (fallback)");
+                }
+                vars.IlEndAt = at;
+                vars.IlEndNow = true;
+            }
+            else vars.TLog("IL fade watch: a black graphic switched on but was " + alpha.ToString("0.00") + " opaque a quarter second in, not the ending; rearming");
         }
     }
 
@@ -892,6 +1494,24 @@ update
            + " -> " + (vars.NewLevel ?? "(inside current level)")
            + ", seen " + lag + ", menu=" + vars.OnMenu + ", sceneOk=" + vars.SceneOk);
 
+    // IL RUNS, the decision (see IL RUNS above). A checkpoint written from
+    // the menu within a quarter second of the click is Scene Selection.
+    if (vars.ClickDecide && vars.OnMenu
+        && Math.Abs((new DateTime(stampTicks) - (DateTime)vars.ClickAt).TotalSeconds) <= 0.25)
+    {
+        vars.ClickDecide = false;
+        string ilLevel = vars.LevelOf(vars.Scene, vars.Flag);
+        if (ilLevel != null && ilLevel != "END")
+        {
+            vars.IlStartLevel = ilLevel;
+            vars.IlStartSub = key;
+            vars.IlStartAt = ((DateTime)vars.ClickAt).Ticks;
+            vars.IlStartNow = true;
+            vars.TLog("Scene Selection: IL run of " + ilLevel);
+        }
+        else vars.TLog("Scene Selection to " + key + ", which is no level: not starting");
+    }
+
     // The final split is the title card, not the blue. Epilogue flag 2 is the
     // blue; the title card fades in about 28 s later, after a scene trigger
     // (EndCameraCut), 8.0 s, the credits starting, and 2.0 s. With the load
@@ -901,9 +1521,30 @@ update
     if (vars.NewLevel == "END")
     {
         vars.NewLevel = null;
+        // An Epilogue IL ends at the blue itself: the frame after the one
+        // that wrote the checkpoint, the first one drawn blue (the cut is
+        // instant). The stamp is on the game's clock, so I move it onto mine.
+        if (vars.IlMode && vars.IlLevel == "Epilogue")
+        {
+            long[] wo = vars.WallOffset;
+            long at = 0L;
+            string how = "the write's stamp";
+            if (vars.PreciseLoads && wo[0] != long.MinValue)
+            {
+                long onMine = stampTicks - wo[0];
+                int fr = vars.FrameAt(onMine);
+                if (fr >= 0) at = vars.FrameTick(fr + 1);
+                if (at != 0L) how = "frame " + (fr + 1) + ", the one after the write";
+                else at = onMine;
+            }
+            if (at == 0L) at = stampTicks;
+            vars.IlEndAt = at;
+            vars.IlEndNow = true;
+            vars.TLog("IL ending: Epilogue blue at " + new DateTime(at).ToString("HH:mm:ss.fff") + ", by " + how);
+        }
         // Any run that reaches the blue arms the final split, whatever level
         // the script thinks it's in, so warps and partial runs work too.
-        if (vars.EndAt == null)
+        else if (vars.EndAt == null)
         {
             vars.BlueAt = new DateTime(stampTicks);
             // With the load thread, EndAt is only the give-up point; without
@@ -945,6 +1586,24 @@ update
                 vars.TLog("start pulled back " + (shift * 1000).ToString("0") + " ms to the intro's 11.0 s");
             }
         }
+        else if (vars.OnMenu && Math.Abs(gap) <= 0.25
+                 && vars.LevelOf(vars.Scene, vars.Flag) != null && vars.LevelOf(vars.Scene, vars.Flag) != "END")
+        {
+            // Scene Selection whose write only became visible after the
+            // quarter-second window closed (the registry occasionally shows a
+            // write late). The provisional start already began on the click,
+            // so it simply becomes the IL run.
+            vars.Pending = false;
+            vars.IlMode = true;
+            vars.IlLevel = vars.LevelOf(vars.Scene, vars.Flag);
+            vars.Level = vars.IlLevel;
+            vars.Entered.Clear();
+            vars.Entered.Add((string)vars.IlLevel);
+            vars.Sub = key;
+            vars.EnteredSubs.Clear();
+            vars.EnteredSubs.Add(key);
+            vars.TLog("late Scene Selection write: provisional start becomes an IL run of " + vars.IlLevel);
+        }
         else
         {
             vars.CancelStart = true;
@@ -971,9 +1630,20 @@ start
     // is scene-selecting the level the save already sits in.
     vars.Backdate = false;
     vars.ClickStart = false;
+    vars.IlStarting = false;
 
-    if (vars.ClickEdge)
+    // An IL run, from Scene Selection (see IL RUNS in update).
+    if (vars.IlStartNow)
     {
+        vars.IlStartNow = false;
+        vars.IlStarting = true;
+        return true;
+    }
+
+    // A click that wasn't Scene Selection: the provisional New Game start.
+    if (vars.NewGameStartNow)
+    {
+        vars.NewGameStartNow = false;
         vars.ClickStart = true;
         return true;
     }
@@ -1007,6 +1677,33 @@ onStart
     vars.TitleArmed = false;
     vars.TitleDone = false;
     if (((IDictionary<string, object>)vars).ContainsKey("TitleWatch")) { var twS = (object[])vars.TitleWatch; twS[0] = null; twS[3] = 0L; }
+
+    vars.IlMode = false;
+    vars.IlLevel = null;
+    vars.IlEndNow = false;
+    vars.IlDone = false;
+    if (((IDictionary<string, object>)vars).ContainsKey("FadeWatch")) ((object[])vars.FadeWatch)[0] = null;
+    if (((IDictionary<string, object>)vars).ContainsKey("TrigWatch"))
+    {
+        var trR = (object[])vars.TrigWatch;
+        trR[0] = null; trR[2] = 0L; trR[3] = 0L;
+        vars.TrigScanFor = -1L;
+    }
+    vars.FixSplitCap = 5.0;
+    if (vars.IlStarting)
+    {
+        // Pull the start back to the click, measured from LiveSplit's own
+        // start stamp for the same reason as the New Game start below.
+        long lsStartIl = (long)vars.Now() - timer.CurrentTime.RealTime.Value.Ticks;
+        TimeSpan backIl = TimeSpan.FromTicks(lsStartIl - (long)vars.IlStartAt);
+        if (backIl < TimeSpan.Zero || backIl > TimeSpan.FromSeconds(1)) backIl = TimeSpan.Zero;
+        timer.AdjustedStartTime   = timer.AdjustedStartTime - backIl;
+        timer.StartTimeWithOffset = timer.StartTimeWithOffset - backIl;
+        timer.StartTime           = timer.StartTime - backIl;
+        vars.IlMode = true;
+        vars.IlLevel = vars.IlStartLevel;
+        vars.TLog("started IL run of " + vars.IlLevel + ", pulled back " + backIl.TotalMilliseconds.ToString("0") + " ms");
+    }
 
     if (vars.ClickStart)
     {
@@ -1046,16 +1743,40 @@ onStart
         }
     }
 
-    vars.Level = "Opening";
     vars.Entered.Clear();
-    vars.Entered.Add("Opening");
-    vars.Sub = "4:0";
     vars.EnteredSubs.Clear();
-    vars.EnteredSubs.Add("4:0");
+    if (vars.IlMode)
+    {
+        // An IL run is in its own level from the first instant.
+        vars.Level = vars.IlLevel;
+        vars.Entered.Add((string)vars.IlLevel);
+        vars.Sub = vars.IlStartSub;
+        vars.EnteredSubs.Add((string)vars.IlStartSub);
+    }
+    else
+    {
+        vars.Level = "Opening";
+        vars.Entered.Add("Opening");
+        vars.Sub = "4:0";
+        vars.EnteredSubs.Add("4:0");
+    }
 }
 
 onReset
 {
+    vars.IlMode = false;
+    vars.IlLevel = null;
+    vars.IlEndNow = false;
+    vars.IlDone = false;
+    if (((IDictionary<string, object>)vars).ContainsKey("FadeWatch")) ((object[])vars.FadeWatch)[0] = null;
+    if (((IDictionary<string, object>)vars).ContainsKey("TrigWatch"))
+    {
+        var trR = (object[])vars.TrigWatch;
+        trR[0] = null; trR[2] = 0L; trR[3] = 0L;
+        vars.TrigScanFor = -1L;
+    }
+    vars.FixSplitCap = 5.0;
+
     // A manual reset during a provisional start drops it too.
     vars.Pending = false;
     vars.CancelStart = false;
@@ -1069,6 +1790,31 @@ onReset
 
 split
 {
+    // An IL run ends when its level does, and that finishes the run: any
+    // segments not split yet (by hand, say) are skipped so the closing split
+    // lands on the last one and the IL's time is the run's final time.
+    var finishIl = (Action)(() =>
+    {
+        var model = new TimerModel { CurrentState = timer };
+        while (timer.CurrentSplitIndex >= 0 && timer.CurrentSplitIndex < timer.Run.Count - 1) model.SkipSplit();
+    });
+
+    // An IL that ends before the next level (IL ENDINGS in update): the
+    // split goes in now and onSplit writes it back to the real moment.
+    if (vars.IlEndNow)
+    {
+        vars.IlEndNow = false;
+        if (!vars.IlMode) return false;
+        vars.IlDone = true;
+        ((object[])vars.FadeWatch)[0] = null;
+        ((object[])vars.TrigWatch)[0] = null;
+        vars.FixSplitTo = new DateTime((long)vars.IlEndAt);
+        vars.FixSplitCap = 120.0;
+        finishIl();
+        vars.TLog("IL run of " + vars.IlLevel + " finished at its ending");
+        return true;
+    }
+
     // The final split: the title card as the load thread saw it, or the
     // fixed delay if it was never seen.
     var twSplit = (object[])vars.TitleWatch;
@@ -1095,6 +1841,12 @@ split
         vars.Entered.Add("END");
         vars.Level = "END";
         vars.TLog("level ended: Epilogue (title card)");
+        if (vars.IlMode)
+        {
+            finishIl();
+            vars.TLog("IL run of Epilogue finished");
+            return true;
+        }
         if (settings["Epilogue"]) { vars.TLog("SPLIT requested"); return true; }
         vars.FixSplitTo = null;
         return false;
@@ -1121,6 +1873,13 @@ split
         string ended = vars.Level;
         vars.Level = nextLevel;
         vars.TLog("level ended: " + ended);
+        if (vars.IlMode)
+        {
+            // Whatever the level settings say, the IL's level ending is the end.
+            finishIl();
+            vars.TLog("IL run of " + ended + " finished");
+            return true;
+        }
         if (ended != null && settings[ended]) fire = true;
     }
 
@@ -1160,10 +1919,10 @@ onSplit
         {
             TimeSpan exact = TimeSpan.FromTicks(((DateTime)vars.FixSplitTo).Ticks - runStart);
             TimeSpan late = real - exact;
-            if (exact > TimeSpan.Zero && late > TimeSpan.Zero && late < TimeSpan.FromSeconds(5))
+            if (exact > TimeSpan.Zero && late > TimeSpan.Zero && late < TimeSpan.FromSeconds((double)vars.FixSplitCap))
             {
                 real = exact;
-                vars.TLog("final split set to the title moment, " + late.TotalMilliseconds.ToString("0") + " ms before LiveSplit's stamp");
+                vars.TLog("split set to its exact moment, " + late.TotalMilliseconds.ToString("0") + " ms before LiveSplit's stamp");
             }
         }
         long removedAt = vars.RemovedUpTo(runStart, runStart + real.Ticks);
@@ -1178,10 +1937,11 @@ onSplit
         if (seg.SplitTime.RealTime != null)
         {
             TimeSpan late = new DateTime((long)vars.Now()) - (DateTime)vars.FixSplitTo;
-            if (late > TimeSpan.Zero && late < TimeSpan.FromSeconds(5))
+            if (late > TimeSpan.Zero && late < TimeSpan.FromSeconds((double)vars.FixSplitCap))
             {
-                // Game Time too: the title card is never inside a load, so
-                // both clocks were running in that gap.
+                // Game Time too. For the title card no load falls in that gap;
+                // after an IL's ending fade the cutscene load does, and on this
+                // fallback path its 60 Hz span is only an estimate anyway.
                 TimeSpan? gt = seg.SplitTime.GameTime;
                 seg.SplitTime = new Time(seg.SplitTime.RealTime.Value - late, gt.HasValue ? gt.Value - late : gt);
                 vars.TLog("final split corrected " + late.TotalMilliseconds.ToString("0") + " ms earlier, to the scheduled moment");
@@ -1189,6 +1949,7 @@ onSplit
         }
         vars.FixSplitTo = null;
     }
+    vars.FixSplitCap = 5.0;
     vars.TLog("LiveSplit split: closed segment " + i + " '" + closed + "' at " + timer.CurrentTime.RealTime);
     if (i >= 1 && i - 1 < timer.Run.Count)
     {
@@ -1249,13 +2010,20 @@ exit
     vars.TLog("game closed");
 
     // A provisional click start whose click was the menu's Quit button can
-    // never be confirmed or cancelled by the game, so I undo it here. A
-    // confirmed run is left alone so a crash doesn't cost the run.
+    // never be confirmed or cancelled by the game, so I undo it here.
     if (vars.Pending)
     {
         vars.Pending = false;
         vars.CancelStart = false;
         vars.TLog("game closed during a provisional start: resetting");
+        new TimerModel { CurrentState = timer }.Reset();
+    }
+    // Quit to Desktop (or a crash, which ends a run anyway) ends a run still in progress, like
+    // quitting to the menu does. A finished run is kept.
+    else if (settings["exitReset"]
+             && (timer.CurrentPhase == TimerPhase.Running || timer.CurrentPhase == TimerPhase.Paused))
+    {
+        vars.TLog("game closed mid-run: reset");
         new TimerModel { CurrentState = timer }.Reset();
     }
 
